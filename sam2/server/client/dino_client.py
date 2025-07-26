@@ -1,17 +1,25 @@
 import base64
+import io
 import numpy as np
 import requests
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 from PIL import Image
 import yaml
 import os
 import matplotlib.pyplot as plt
 
 
-def encode_image(image_path: str) -> str:
-    """Encode local image file to base64"""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode('utf-8')
+def encode_image(image: Union[str, Image.Image]) -> str:
+    """Encode local image file path or PIL Image to base64"""
+    if isinstance(image, str):
+        with open(image, "rb") as f:
+            return base64.b64encode(f.read()).decode('utf-8')
+    elif isinstance(image, Image.Image):
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    else:
+        raise ValueError("Image must be a file path (str) or a PIL.Image.Image object.")
 
 
 def decode_features(features_base64: str, shape: list) -> np.ndarray:
@@ -29,7 +37,7 @@ def _get_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     return headers
 
 
-def extract_dino_features(image: Optional[str] = None, image_url: Optional[str] = None,
+def extract_dino_features(image: Optional[Union[str, Image.Image]] = None, image_url: Optional[str] = None,
                           base_url: str = "",
                           model_type: str = "dinov2_vitl14",
                           stride: Optional[int] = None,
@@ -65,7 +73,7 @@ def extract_dino_features(image: Optional[str] = None, image_url: Optional[str] 
     }
 
     if image:
-        payload['image'] = image
+        payload['image'] = encode_image(image)
     elif image_url:
         payload['image_url'] = image_url
     else:
@@ -89,11 +97,10 @@ def get_dino_health(base_url: str = "") -> Dict:
 
 
 # Convenience function that combines request + decode
-def extract_dino_features_decoded(image_path: str = None, **kwargs) -> np.ndarray:
+def extract_dino_features_decoded(image: Union[str, Image.Image] = None, **kwargs) -> np.ndarray:
     """Extract DINO features and return decoded numpy array"""
-    if image_path:
-        image_base64 = encode_image(image_path)
-        kwargs['image'] = image_base64
+    if image:
+        kwargs['image'] = image
 
     result = extract_dino_features(**kwargs)
     return decode_features(result['features'], result['shape'])

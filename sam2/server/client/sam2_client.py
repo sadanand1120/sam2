@@ -1,17 +1,25 @@
 import base64
+import io
 import numpy as np
 import requests
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Union
 from PIL import Image
 import yaml
 import os
 from sam2.features.utils import SAM2utils
 
 
-def encode_image(image_path: str) -> str:
-    """Encode local image file to base64"""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode('utf-8')
+def encode_image(image: Union[str, Image.Image]) -> str:
+    """Encode local image file path or PIL Image to base64"""
+    if isinstance(image, str):
+        with open(image, "rb") as f:
+            return base64.b64encode(f.read()).decode('utf-8')
+    elif isinstance(image, Image.Image):
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    else:
+        raise ValueError("Image must be a file path (str) or a PIL.Image.Image object.")
 
 
 def encode_mask(mask: np.ndarray) -> str:
@@ -85,7 +93,7 @@ def _get_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     return headers
 
 
-def generate_sam2_auto_masks(image: Optional[str] = None, image_url: Optional[str] = None,
+def generate_sam2_auto_masks(image: Optional[Union[str, Image.Image]] = None, image_url: Optional[str] = None,
                              base_url: str = "",
                              preset: Optional[str] = None,
                              points_per_side: Optional[int] = None,
@@ -127,7 +135,7 @@ def generate_sam2_auto_masks(image: Optional[str] = None, image_url: Optional[st
     }
 
     if image:
-        payload['image'] = image
+        payload['image'] = encode_image(image)
     elif image_url:
         payload['image_url'] = image_url
     else:
@@ -142,7 +150,7 @@ def generate_sam2_auto_masks(image: Optional[str] = None, image_url: Optional[st
     return response.json()
 
 
-def generate_sam2_prompt_masks(image: Optional[str] = None, image_url: Optional[str] = None,
+def generate_sam2_prompt_masks(image: Optional[Union[str, Image.Image]] = None, image_url: Optional[str] = None,
                                base_url: str = "",
                                point_coords: Optional[List[List[float]]] = None,
                                point_labels: Optional[List[int]] = None,
@@ -172,7 +180,7 @@ def generate_sam2_prompt_masks(image: Optional[str] = None, image_url: Optional[
     }
 
     if image:
-        payload['image'] = image
+        payload['image'] = encode_image(image)
     elif image_url:
         payload['image_url'] = image_url
     else:
@@ -196,21 +204,19 @@ def get_sam2_health(base_url: str = "") -> Dict:
 
 
 # Convenience functions that combine request + decode
-def generate_sam2_auto_masks_decoded(image_path: str = None, **kwargs) -> List[Dict[str, Any]]:
+def generate_sam2_auto_masks_decoded(image: Union[str, Image.Image] = None, **kwargs) -> List[Dict[str, Any]]:
     """Generate automatic masks and return the decoded mask dictionaries"""
-    if image_path:
-        image_base64 = encode_image(image_path)
-        kwargs['image'] = image_base64
+    if image:
+        kwargs['image'] = image
 
     result = generate_sam2_auto_masks(**kwargs)
     return decode_auto_masks(result['masks'])
 
 
-def generate_sam2_prompt_masks_decoded(image_path: str = None, **kwargs) -> tuple:
+def generate_sam2_prompt_masks_decoded(image: Union[str, Image.Image] = None, **kwargs) -> tuple:
     """Generate prompt masks and return decoded numpy arrays"""
-    if image_path:
-        image_base64 = encode_image(image_path)
-        kwargs['image'] = image_base64
+    if image:
+        kwargs['image'] = image
 
     result = generate_sam2_prompt_masks(**kwargs)
 
@@ -222,30 +228,30 @@ def generate_sam2_prompt_masks_decoded(image_path: str = None, **kwargs) -> tupl
 
 
 # Advanced convenience functions for common use cases
-def sam2_point_mask(image_path: str, point_coords: List[List[float]], point_labels: List[int], **kwargs):
+def sam2_point_mask(image: Union[str, Image.Image], point_coords: List[List[float]], point_labels: List[int], **kwargs):
     """Generate mask from point prompts"""
     return generate_sam2_prompt_masks_decoded(
-        image_path=image_path,
+        image=image,
         point_coords=point_coords,
         point_labels=point_labels,
         **kwargs
     )
 
 
-def sam2_box_mask(image_path: str, box: List[float], **kwargs):
+def sam2_box_mask(image: Union[str, Image.Image], box: List[float], **kwargs):
     """Generate mask from box prompt"""
     return generate_sam2_prompt_masks_decoded(
-        image_path=image_path,
+        image=image,
         box=box,
         **kwargs
     )
 
 
-def sam2_combined_mask(image_path: str, point_coords: List[List[float]] = None,
+def sam2_combined_mask(image: Union[str, Image.Image], point_coords: List[List[float]] = None,
                        point_labels: List[int] = None, box: List[float] = None, **kwargs):
     """Generate mask from combined point and box prompts"""
     return generate_sam2_prompt_masks_decoded(
-        image_path=image_path,
+        image=image,
         point_coords=point_coords,
         point_labels=point_labels,
         box=box,
@@ -284,16 +290,24 @@ if __name__ == "__main__":
     SAM2utils.visualize_masks(img, coarse_masks)
 
     # Generate fine-grained masks
-    # NOTE: this is HIGHLY memory intensive and will fail for large images and/or running with multiple workers
+    # NOTE: this is HIGHLY memory intensive and will crash the server for large images and/or running with multiple workers
+    aspect_ratio = img.width / img.height
+    if img.width < img.height:
+        new_width = 512
+        new_height = int(512 / aspect_ratio)
+    else:
+        new_height = 512
+        new_width = int(512 * aspect_ratio)
+    small_img = img.resize((new_width, new_height))
     print("Generating fine-grained masks...")
     fine_masks = generate_sam2_auto_masks_decoded(
-        test_image_path,
+        small_img,
         base_url=base_url,
         api_key=api_key,
         preset="fine_grained"
     )
     print(f"Generated {len(fine_masks)} fine-grained masks")
-    SAM2utils.visualize_masks(img, fine_masks)
+    SAM2utils.visualize_masks(small_img, fine_masks)
 
     print("\n=== Prompt-based Mask Generation Demo ===")
 
