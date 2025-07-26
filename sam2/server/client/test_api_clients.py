@@ -8,6 +8,7 @@ import time
 import yaml
 import os
 from PIL import Image
+from tqdm import tqdm
 
 from sam2.server.client.clip_client import *
 from sam2.server.client.dino_client import *
@@ -478,9 +479,9 @@ def test_image_url():
         print(f"❌ SAM2 Image URL error: {e}")
 
 
-def test_concurrent_requests(num_requests=10):
+def test_concurrent_requests(num_requests=10, timeout_seconds=1800, stagger_seconds=0.5):
     """Test concurrent requests for all servers"""
-    print(f"\n⚡ Testing Concurrent Requests (num_requests={num_requests})...")
+    print(f"\n⚡ Testing Concurrent Requests (num_requests={num_requests}, timeout={timeout_seconds}s)...")
 
     with open("sam2/server/client/servers.yaml", "r") as f:
         servers = yaml.safe_load(f)
@@ -542,6 +543,12 @@ def test_concurrent_requests(num_requests=10):
                         'success': False,
                         'error': f"HTTP {response.status}: {error_text}"
                     }
+        except asyncio.TimeoutError:
+            return {
+                'request_id': request_id,
+                'success': False,
+                'error': "Request timeout"
+            }
         except Exception as e:
             return {
                 'request_id': request_id,
@@ -557,15 +564,27 @@ def test_concurrent_requests(num_requests=10):
 
         start_time = time.time()
 
-        async with aiohttp.ClientSession() as session:
+        # Create session with configurable timeout for long-running requests
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)  # Use timeout in seconds
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             tasks = []
-            for i in range(num_requests):
-                # Add staggering: delay each request by 0.1 seconds to allow workers to spawn
-                await asyncio.sleep(1)
+            for i in tqdm(range(num_requests), desc=f"Sending {service_name} requests"):
+                # Add small staggering: delay each request by stagger_seconds to allow workers to spawn
+                await asyncio.sleep(stagger_seconds)
                 task = asyncio.create_task(make_request(session, i, service_name, base_url, api_key, image_base64))
                 tasks.append(task)
 
-            results = await asyncio.gather(*tasks)
+            # Track responses with progress bar
+            results = []
+            with tqdm(total=num_requests, desc=f"Receiving {service_name} responses") as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    result = await coro
+                    results.append(result)
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'success': len([r for r in results if r['success']]),
+                        'failed': len([r for r in results if not r['success']])
+                    })
 
             end_time = time.time()
             total_time = end_time - start_time
@@ -586,21 +605,10 @@ def test_concurrent_requests(num_requests=10):
             for result in failed_requests[:3]:  # Show first 3 failures
                 print(f"   Failed request {result['request_id']}: {result['error']}")
 
-    # Test concurrent requests for all services in parallel
-    async def run_all_services_parallel():
-        print("🚀 Testing ALL services concurrently in parallel...")
-
-        # Create tasks for all services
-        tasks = []
-        for service_name in ["clip", "dino", "sam2"]:
-            task = asyncio.create_task(run_concurrent_test(service_name, num_requests))
-            tasks.append(task)
-
-        # Run all services in parallel
-        await asyncio.gather(*tasks)
-
-    # Run the parallel test
-    asyncio.run(run_all_services_parallel())
+    # Test concurrent requests for all services in sequence
+    for service_name in ["clip", "dino", "sam2"]:
+        print(f"\n--- Testing {service_name.upper()} Concurrent Requests ---")
+        asyncio.run(run_concurrent_test(service_name, num_requests))
 
 
 def test_parameter_validation():
@@ -836,4 +844,4 @@ if __name__ == "__main__":
     # test_image_url()
     # test_parameter_validation()
     # test_convenience_functions()
-    test_concurrent_requests(100)
+    test_concurrent_requests(200, timeout_seconds=7200, stagger_seconds=1.0)

@@ -1,11 +1,11 @@
-clip:  # can fit 8 workers / gpu
+clip:  # can fit 8 workers / gpu robolidar
   base_url: "http://10.0.0.211:8096"
   api_key: "smfeats"
 
-dino:  # can fit 12 workers / gpu
+dino:  # can fit 12 workers / gpu robolidar
   base_url: "http://10.0.0.211:8097"
   api_key: "smfeats"
 
-sam2:  # can fit 4 workers / gpu
+sam2:  # can fit 4 workers / gpu robolidar
   base_url: "http://10.0.0.211:8098"
   api_key: "smfeats"
