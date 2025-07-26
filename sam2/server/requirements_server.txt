@@ -1,0 +1,32 @@
+# Core ML dependencies (install manually based on your CUDA version)
+# torch
+# torchvision
+
+# Web framework and API
+fastapi
+uvicorn[standard]
+pydantic==2.11.7
+
+# Image processing
+Pillow
+numpy
+opencv-python
+
+# HTTP and data
+requests
+
+# Additional dependencies
+python-json-logger
+fastapi-security
+
+# CLIP dependencies
+open-clip-torch
+einops
+
+# DINO dependencies
+timm
+
+# SAM2 - assume already installed in environment
+
+# Visualization (optional, for testing)
+matplotlib 

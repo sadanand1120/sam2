@@ -25,10 +25,19 @@ class SAM2features:
         self.device = device or torch.device("cpu")
 
         # Build SAM2 model (hydra fix: add /  or // to paths)
-        try:
-            self.model = build_sam2("/" + model_cfg, "/" + checkpoint_path, device=self.device, apply_postprocessing=False)
-        except:
-            self.model = build_sam2("//" + model_cfg, "//" + checkpoint_path, device=self.device, apply_postprocessing=False)
+        for p in ("", "/", "//"):
+            try:
+                self.model = build_sam2(
+                    f"{p}{model_cfg}",
+                    f"{p}{checkpoint_path}",
+                    device=self.device,
+                    apply_postprocessing=False
+                )
+                break
+            except:
+                pass
+        else:
+            raise RuntimeError("Could not build SAM2 model")
 
         # Predefined intelligent presets for automatic mask generation
         self.AUTO_FINE_GRAINED_MASKS = {
