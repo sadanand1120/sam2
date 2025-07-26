@@ -283,7 +283,8 @@ if __name__ == "__main__":
     print(f"Generated {len(coarse_masks)} coarse masks")
     SAM2utils.visualize_masks(img, coarse_masks)
 
-    # Generate fine-grained masks (exactly matching main file)
+    # Generate fine-grained masks
+    # NOTE: this is HIGHLY memory intensive and will fail for large images and/or running with multiple workers
     print("Generating fine-grained masks...")
     fine_masks = generate_sam2_auto_masks_decoded(
         test_image_path,
