@@ -85,6 +85,34 @@ def decode_auto_masks(masks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return decoded_masks
 
 
+def masks_to_instance_mask(masks_list: List[Dict[str, Any]], min_iou: float = 0.0, min_area: float = 0.0) -> np.ndarray:
+    """Convert list of masks to instance mask array with sorted instance IDs by IoU"""
+    if not masks_list:
+        return np.array([])
+
+    # Filter masks using existing utils
+    filtered_masks = SAM2utils.filter_masks_by_score(masks_list, min_iou=min_iou)
+    filtered_masks = SAM2utils.filter_masks_by_area(filtered_masks, min_area=min_area)
+
+    if not filtered_masks:
+        return np.array([])
+
+    # Sort by IoU (highest first)
+    filtered_masks.sort(key=lambda x: x.get('predicted_iou', 0), reverse=True)
+
+    # Get image dimensions from first mask
+    first_mask = filtered_masks[0]['segmentation']
+    height, width = first_mask.shape
+    instance_mask = np.zeros((height, width), dtype=np.uint8)
+
+    # Assign instance IDs (1-based)
+    for i, mask_dict in enumerate(filtered_masks):
+        mask = mask_dict['segmentation']
+        instance_mask[mask] = i + 1
+
+    return instance_mask
+
+
 def _get_headers(api_key: Optional[str] = None) -> Dict[str, str]:
     """Get headers with optional API key"""
     headers = {"Content-Type": "application/json"}
