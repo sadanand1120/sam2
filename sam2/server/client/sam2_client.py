@@ -6,6 +6,8 @@ from typing import Dict, Optional, List, Any, Union
 from PIL import Image
 import yaml
 import os
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 from sam2.features.utils import SAM2utils
 
 
@@ -85,8 +87,20 @@ def decode_auto_masks(masks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return decoded_masks
 
 
-def masks_to_instance_mask(masks_list: List[Dict[str, Any]], min_iou: float = 0.0, min_area: float = 0.0) -> np.ndarray:
-    """Convert list of masks to instance mask array with sorted instance IDs by IoU"""
+def auto_masks_to_instance_mask(
+    masks_list: List[Dict[str, Any]],
+    min_iou: float = 0.0,
+    min_area: float = 0.0,
+    assign_by: str = "iou",
+    start_from: str = "low",
+) -> np.ndarray:
+    """Convert list of masks to an instance mask with configurable ordering.
+
+    - Background (no mask) has id 0.
+    - IDs are assigned by descending quality so that id 1 is best (e.g., highest IoU), id 2 next, etc.
+    - The write order is controlled by `start_from` to determine overwrite behavior in overlaps.
+      Using `start_from='low'` ensures higher-quality masks are written last so they win overlaps.
+    """
     if not masks_list:
         return np.array([])
 
@@ -97,20 +111,157 @@ def masks_to_instance_mask(masks_list: List[Dict[str, Any]], min_iou: float = 0.
     if not filtered_masks:
         return np.array([])
 
-    # Sort by IoU (highest first)
-    filtered_masks.sort(key=lambda x: x.get('predicted_iou', 0), reverse=True)
+    # Choose sort key according to assign_by
+    def _mask_key(m: Dict[str, Any]) -> float:
+        if assign_by == "area":
+            area_val = m.get("area")
+            if isinstance(area_val, (int, float)):
+                return float(area_val)
+            seg = m.get("segmentation")
+            return float(np.count_nonzero(seg)) if isinstance(seg, np.ndarray) else 0.0
+        # default: IoU
+        return float(m.get('predicted_iou', 0.0))
 
-    # Get image dimensions from first mask
-    first_mask = filtered_masks[0]['segmentation']
+    # Rank masks by descending key for IDs (1=best)
+    indices_desc = sorted(range(len(filtered_masks)), key=lambda i: _mask_key(filtered_masks[i]), reverse=True)
+    rank_id = {idx: rank + 1 for rank, idx in enumerate(indices_desc)}
+
+    # Determine traversal order for writing (controls overwrite semantics)
+    write_reverse = (start_from == "high")
+    traversal = sorted(range(len(filtered_masks)), key=lambda i: _mask_key(filtered_masks[i]), reverse=write_reverse)
+
+    # Get image dimensions from first in traversal
+    first_mask = filtered_masks[traversal[0]]['segmentation']
     height, width = first_mask.shape
     instance_mask = np.zeros((height, width), dtype=np.uint8)
 
-    # Assign instance IDs (1-based)
-    for i, mask_dict in enumerate(filtered_masks):
+    # Overwrite semantics: later writes win. IDs come from rank_id so 1=best consistently.
+    for idx in traversal:
+        mask_dict = filtered_masks[idx]
         mask = mask_dict['segmentation']
-        instance_mask[mask] = i + 1
+        if mask.dtype != np.bool_:
+            mask = mask.astype(bool)
+        instance_mask[mask] = rank_id[idx]
 
     return instance_mask
+
+
+def compute_overlap_stats(decoded_masks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute overlap statistics for a list of decoded masks."""
+    if not decoded_masks:
+        return {"num_masks": 0, "overlap_pixels": 0, "max_overlap": 0, "total_pixels": 0}
+    stack = np.stack([m["segmentation"].astype(np.uint8) for m in decoded_masks], axis=0)
+    per_pixel_counts = stack.sum(axis=0)
+    overlap_pixels = int((per_pixel_counts > 1).sum())
+    max_overlap = int(per_pixel_counts.max())
+    total_pixels = per_pixel_counts.size
+    return {
+        "num_masks": stack.shape[0],
+        "overlap_pixels": overlap_pixels,
+        "max_overlap": max_overlap,
+        "total_pixels": total_pixels,
+    }
+
+
+def build_instance_colormap(num_instances: int) -> ListedColormap:
+    """Colormap with black background (index 0) and spaced colors for instances.
+
+    Colors are assigned by alternating from both ends of a base gradient to maximize perceptual separation,
+    e.g., order: 0, N-1, 1, N-2, ... over a base palette.
+    """
+    if num_instances <= 0:
+        return ListedColormap([(0, 0, 0, 1)])
+
+    # Base palette from a continuous colormap (e.g., 'tab20' is discrete but small; use hsv for many)
+    base = [plt.cm.hsv(t) for t in np.linspace(0, 1, num_instances, endpoint=False)]
+
+    # Alternating index sequence: 0, N-1, 1, N-2, 2, N-3, ...
+    order = []
+    lo, hi = 0, num_instances - 1
+    while lo <= hi:
+        order.append(lo)
+        if lo != hi:
+            order.append(hi)
+        lo += 1
+        hi -= 1
+
+    # Assemble RGBA colors: black for background, then ordered instance colors
+    colors = [(0, 0, 0, 1)] + [tuple(base[i][:3]) + (1,) for i in order]
+    return ListedColormap(colors)
+
+
+def make_viz_mask_and_cmap(instance_mask: np.ndarray) -> tuple:
+    """Return (viz_mask, cmap, norm) with black background and well-separated instance colors.
+
+    - Remaps instance IDs (only for visualization) by alternating extremes over area-sorted IDs
+      so large regions get well-separated colors: order on IDs by area desc, then indices 0, N-1, 1, N-2, ...
+    - Uses BoundaryNorm to ensure discrete color bins per integer ID.
+    """
+    if instance_mask.size == 0:
+        cmap = ListedColormap([(0, 0, 0, 1)])
+        norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
+        return instance_mask, cmap, norm
+
+    ids = np.unique(instance_mask)
+    ids = ids[ids != 0]
+    N = int(len(ids))
+    if N == 0:
+        cmap = ListedColormap([(0, 0, 0, 1)])
+        norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
+        return instance_mask, cmap, norm
+
+    # Compute pixel counts per id
+    max_id = int(instance_mask.max())
+    counts = np.bincount(instance_mask.ravel(), minlength=max_id + 1)
+    id_counts = [(int(i), int(counts[i])) for i in ids]
+    # Sort by area descending
+    id_counts.sort(key=lambda x: x[1], reverse=True)
+
+    # Alternating extremes order over indices 0..N-1
+    order = []
+    lo, hi = 0, N - 1
+    while lo <= hi:
+        order.append(lo)
+        if lo != hi:
+            order.append(hi)
+        lo += 1
+        hi -= 1
+
+    # Build mapping: id -> new viz index 1..N according to alternating-extreme positions
+    viz_rank_for_sorted = {idx: rank + 1 for rank, idx in enumerate(order)}
+    mapping = {id_counts[i][0]: viz_rank_for_sorted[i] for i in range(N)}
+
+    # Remap instance ids for visualization only (background stays 0)
+    viz_mask = np.zeros_like(instance_mask, dtype=np.uint16)
+    for inst_id, viz_id in mapping.items():
+        viz_mask[instance_mask == inst_id] = viz_id
+
+    # Build a spaced color list using golden-ratio hue stepping
+    base_colors = []
+    phi = (1 + 5 ** 0.5) / 2.0
+    step = 1.0 / phi
+    for k in range(N):
+        h = (k * step) % 1.0
+        r, g, b, _ = plt.cm.hsv(h)
+        base_colors.append((r, g, b, 1))
+    cmap = ListedColormap([(0, 0, 0, 1)] + base_colors)
+    # Discrete bins for 0..N
+    boundaries = np.arange(N + 2) - 0.5
+    norm = BoundaryNorm(boundaries, ncolors=N + 1)
+    return viz_mask, cmap, norm
+
+
+def _prevent_oom_downscale_img(image: Union[str, Image.Image], target: int) -> Image.Image:
+    """Return a PIL image where max(H, W) <= target; keep aspect ratio. No-op if already small."""
+    img = Image.open(image) if isinstance(image, str) else image
+    w, h = img.width, img.height
+    max_side = max(w, h)
+    if max_side <= target:
+        return img
+    scale = float(target) / float(max_side)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return img.resize((new_w, new_h), resample=Image.LANCZOS)
 
 
 def _get_headers(api_key: Optional[str] = None) -> Dict[str, str]:
@@ -316,17 +467,25 @@ if __name__ == "__main__":
     )
     print(f"Generated {len(coarse_masks)} coarse masks")
     SAM2utils.visualize_masks(img, coarse_masks)
+    # Overlap analysis and instance mask demo for coarse
+    coarse_stats = compute_overlap_stats(coarse_masks)
+    if coarse_stats["total_pixels"] > 0:
+        coarse_pct = 100.0 * coarse_stats["overlap_pixels"] / coarse_stats["total_pixels"]
+        print(f"Coarse Overlap: masks={coarse_stats['num_masks']}, overlap_pixels={coarse_stats['overlap_pixels']} ({coarse_pct:.3f}%), max_overlap={coarse_stats['max_overlap']}")
+    # 2x2 grid: assign_by ∈ {iou, area} × start_from ∈ {low, high}
+    configs = [("iou", "low"), ("iou", "high"), ("area", "low"), ("area", "high")]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    for ax, (assign_by, start_from) in zip(axes.flat, configs):
+        inst = auto_masks_to_instance_mask(coarse_masks, assign_by=assign_by, start_from=start_from)
+        viz_inst, cmap, norm = make_viz_mask_and_cmap(inst)
+        ax.imshow(viz_inst, cmap=cmap, norm=norm)
+        ax.set_title(f"coarse: {assign_by}, {start_from}")
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
 
-    # Generate fine-grained masks
-    # NOTE: this is HIGHLY memory intensive and will crash the server for large images and/or running with multiple workers
-    aspect_ratio = img.width / img.height
-    if img.width < img.height:
-        new_width = 512
-        new_height = int(512 / aspect_ratio)
-    else:
-        new_height = 512
-        new_width = int(512 * aspect_ratio)
-    small_img = img.resize((new_width, new_height))
+    # Generate fine-grained masks (downscale only if needed to avoid OOM)
+    small_img = _prevent_oom_downscale_img(img, target=512)
     print("Generating fine-grained masks...")
     fine_masks = generate_sam2_auto_masks_decoded(
         small_img,
@@ -336,6 +495,21 @@ if __name__ == "__main__":
     )
     print(f"Generated {len(fine_masks)} fine-grained masks")
     SAM2utils.visualize_masks(small_img, fine_masks)
+    # Overlap analysis and instance mask demo for fine
+    fine_stats = compute_overlap_stats(fine_masks)
+    if fine_stats["total_pixels"] > 0:
+        fine_pct = 100.0 * fine_stats["overlap_pixels"] / fine_stats["total_pixels"]
+        print(f"Fine Overlap: masks={fine_stats['num_masks']}, overlap_pixels={fine_stats['overlap_pixels']} ({fine_pct:.3f}%), max_overlap={fine_stats['max_overlap']}")
+    # 2x2 grid for fine masks as well
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10))
+    for ax, (assign_by, start_from) in zip(axes.flat, configs):
+        inst = auto_masks_to_instance_mask(fine_masks, assign_by=assign_by, start_from=start_from)
+        viz_inst, cmap, norm = make_viz_mask_and_cmap(inst)
+        ax.imshow(viz_inst, cmap=cmap, norm=norm)
+        ax.set_title(f"fine: {assign_by}, {start_from}")
+        ax.axis('off')
+    plt.tight_layout()
+    plt.show()
 
     print("\n=== Prompt-based Mask Generation Demo ===")
 
