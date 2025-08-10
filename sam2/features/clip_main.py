@@ -7,6 +7,7 @@ import os
 import matplotlib.pyplot as plt
 from einops import rearrange
 from sam2.features.utils import preprocess_image, interpolate_positional_embedding, apply_pca_colormap, pad_to_multiple, upsample_and_unpad
+from tqdm import tqdm
 
 
 class CLIPfeatures:
@@ -41,7 +42,8 @@ class CLIPfeatures:
                 pca_q_max=0.99,
                 interpolation_mode="bilinear",
                 tensor_format="HWC",
-                padding_mode="constant"):
+                padding_mode="constant",
+                return_meta: bool = False):
         """
         Extract CLIP features from an image.
 
@@ -87,6 +89,14 @@ class CLIPfeatures:
         if not ret_patches:
             patch_desc = upsample_and_unpad(patch_desc, (padded_h, padded_w), pad_h, pad_w, tensor_format=tensor_format, mode=interpolation_mode)
 
+        if return_meta:
+            meta = {
+                "padded_h": padded_h,
+                "padded_w": padded_w,
+                "pad_h": pad_h,
+                "pad_w": pad_w,
+            }
+            return patch_desc, meta
         return patch_desc
 
     @torch.inference_mode()
@@ -125,13 +135,17 @@ class CLIPfeatures:
 
     @torch.inference_mode()
     def compute_similarity(self, patch_desc, text_emb, softmax=1.0):
-        # patch_desc: (h, w, d) or (h, w, 3) if PCA, text_emb: (d,) or (3,)
-        # Returns similarity map (h, w) as numpy (for viz)
+        """
+        softmax: None to just get the raw similarity
+        patch_desc: (h, w, d) or (h, w, 3) if PCA, text_emb: (d,) or (3,)
+        Returns:
+            similarity map (h, w)
+        """
         h, w, d = patch_desc.shape
         patch_flat = patch_desc.reshape(-1, d)
         sim = patch_flat @ text_emb
         sim = sim.reshape(h, w)
-        if softmax > 0:
+        if softmax is not None and softmax > 0:
             sim_exp = torch.exp(sim * softmax)
             sim = sim_exp / sim_exp.sum()
         return sim
@@ -148,13 +162,14 @@ if __name__ == "__main__":
     plt.axis("off")
     plt.show()
 
-    # Demo: text similarity
-    desc = clipper.extract(img, ret_pca=False, ret_patches=False, load_size=2048)
+    # Demo: text similarity, do similarity compute on patches for mem efficiency -> then upsample
+    desc, meta = clipper.extract(img, ret_pca=False, ret_patches=True, load_size=2048, return_meta=True)
     print(f"Descriptor shape: {desc.shape}")
     text_emb = clipper.encode_text("car")
     print(f"Text embedding shape: {text_emb.shape}")
     sim_map = clipper.compute_similarity(desc, text_emb, softmax=0.25)
-    plt.imshow(sim_map.cpu().numpy(), cmap="turbo")
+    sim_vis = upsample_and_unpad(sim_map.unsqueeze(-1), (meta["padded_h"], meta["padded_w"]), meta["pad_h"], meta["pad_w"], tensor_format="HWC", mode="bilinear").squeeze()
+    plt.imshow(sim_vis.cpu().numpy(), cmap="turbo")
     plt.title("Similarity to 'car'")
     plt.axis("off")
     plt.show()
