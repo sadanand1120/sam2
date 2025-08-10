@@ -13,9 +13,7 @@ class DINOfeatures:
         self.device = device or torch.device("cpu")
 
         # Initialize DINO extractor
-        self.extractor = ViTExtractor(model_type=self.model_type, stride=self.stride)
-        self.extractor.model.to(self.device)
-        self.extractor.model.eval()
+        self.extractor = ViTExtractor(model_type=self.model_type, stride=self.stride, device=self.device)
 
         # Get patch size for padding
         self.patch_size = self.extractor.p

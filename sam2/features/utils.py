@@ -4,8 +4,140 @@ import numpy as np
 import torchvision.transforms as transforms
 from torchvision.transforms import CenterCrop, Compose, Resize, InterpolationMode, ToTensor, Normalize
 from pathlib import Path
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, List, Dict, Any, Callable, Type
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from itertools import cycle
+import threading
+import asyncio
+from tqdm.auto import tqdm
+import io
+import requests
+
+
+class DeviceRoundRobin:
+    def __init__(self):
+        if torch.cuda.is_available():
+            self._iter = cycle(range(torch.cuda.device_count()))
+        else:
+            self._iter = None
+
+    def next(self):
+        if self._iter is None:
+            return 'cpu'
+        return f'cuda:{next(self._iter)}'
+
+
+class AsyncModelRunnerParallel:
+    def __init__(self, device: Union[str, torch.device]):
+        self.device = torch.device(device)
+        self._models: Dict[str, Any] = {}
+        self._locks: Dict[str, threading.Lock] = {}
+
+    def get_or_create_model(self, key: str, factory: Callable[[], Any]) -> Any:
+        if key not in self._models:
+            self._models[key] = factory()
+            self._locks[key] = threading.Lock()
+        return self._models[key]
+
+    def get_lock(self, key: str) -> threading.Lock:
+        if key not in self._locks:
+            self._locks[key] = threading.Lock()
+        return self._locks[key]
+
+    def load_image(self,
+                   image: Optional[Union[str, Path, Image.Image]] = None,
+                   image_url: Optional[str] = None) -> Image.Image:
+        if image is not None:
+            if isinstance(image, (str, Path)):
+                return Image.open(image).convert('RGB')
+            if isinstance(image, Image.Image):
+                return image.convert('RGB')
+            raise ValueError("image must be str, Path, or PIL Image")
+        if image_url is not None:
+            resp = requests.get(image_url)
+            resp.raise_for_status()
+            return Image.open(io.BytesIO(resp.content)).convert('RGB')
+        raise ValueError("Either image or image_url must be provided")
+
+    async def run_in_executor(self, func: Callable, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+    @classmethod
+    async def async_run_tasks(cls, awaitables: List[asyncio.Future], desc: Optional[str] = None) -> List[Any]:
+        if desc is None:
+            desc = cls.__name__
+
+        async def _wrap_with_index(i, aw):
+            res = await aw
+            return i, res
+
+        tasks = [asyncio.create_task(_wrap_with_index(i, aw)) for i, aw in enumerate(awaitables)]
+        results: List[Any] = [None] * len(tasks)
+        with tqdm(total=len(tasks), desc=desc) as pbar:
+            for t in asyncio.as_completed(tasks):
+                i, res = await t
+                results[i] = res
+                pbar.update(1)
+        return results
+
+
+class AsyncMultiWrapper:
+    """
+    Minimal wrapper to dispatch method calls across multiple worker instances
+    in a round-robin fashion. If num_objects > available GPUs, devices repeat
+    from the beginning (circular assignment).
+
+    Example:
+        wrapper = AsyncMultiWrapper(DINOFeaturesUnified, num_objects=2)
+        task = wrapper.extract_features_async(...)
+    """
+
+    def __init__(
+        self,
+        worker_cls: Type[Any],
+        num_objects: int = 1,
+        devices: Optional[Union[str, torch.device, List[Union[str, torch.device]]]] = None,
+        **worker_kwargs: Any,
+    ) -> None:
+        if num_objects < 1:
+            raise ValueError("num_objects must be >= 1")
+
+        if devices is None:
+            dev_iter = DeviceRoundRobin()
+            dev_list = [dev_iter.next() for _ in range(num_objects)]
+        elif isinstance(devices, (str, torch.device)):
+            dev_list = [devices] * num_objects
+        else:
+            dev_list = list(devices)
+            if len(dev_list) < num_objects:
+                cyc = cycle(dev_list)
+                dev_list = [next(cyc) for _ in range(num_objects)]
+            else:
+                dev_list = dev_list[:num_objects]
+
+        self._workers: List[Any] = [worker_cls(device=d, **worker_kwargs) for d in dev_list]
+        self._rr_lock = threading.Lock()
+        self._rr_index = 0
+
+    def _next_worker(self) -> Any:
+        with self._rr_lock:
+            idx = self._rr_index
+            self._rr_index = (self._rr_index + 1) % len(self._workers)
+        return self._workers[idx]
+
+    def __getattr__(self, name: str):  # Dispatch any unknown attribute to the next worker
+        def _call_through(*args, **kwargs):
+            worker = self._next_worker()
+            attr = getattr(worker, name)
+            return attr(*args, **kwargs)
+
+        return _call_through
+
+    @staticmethod
+    async def async_run_tasks(awaitables: List[asyncio.Future], desc: Optional[str] = None) -> List[Any]:
+        return await AsyncModelRunnerParallel.async_run_tasks(awaitables, desc)
 
 
 def interpolate_positional_embedding(positional_embedding: torch.Tensor, x: torch.Tensor, patch_size: int, w: int, h: int):
@@ -402,6 +534,45 @@ class SAM2utils:
             plt.show()
 
     @staticmethod
+    def build_instance_colormap(num_instances: int) -> ListedColormap:
+        if num_instances <= 0:
+            return ListedColormap([(0, 0, 0, 1)])
+
+        base = [plt.cm.hsv(t) for t in np.linspace(0, 1, num_instances, endpoint=False)]
+
+        order: List[int] = []
+        lo, hi = 0, num_instances - 1
+        while lo <= hi:
+            order.append(lo)
+            if lo != hi:
+                order.append(hi)
+            lo += 1
+            hi -= 1
+
+        colors = [(0, 0, 0, 1)] + [tuple(base[i][:3]) + (1,) for i in order]
+        return ListedColormap(colors)
+
+    @staticmethod
+    def make_viz_mask_and_cmap(instance_mask: np.ndarray) -> Tuple[np.ndarray, ListedColormap, BoundaryNorm]:
+        if instance_mask.size == 0:
+            cmap = ListedColormap([(0, 0, 0, 1)])
+            norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
+            return instance_mask, cmap, norm
+
+        ids = np.unique(instance_mask)
+        ids = ids[ids != 0]
+        num_instances = int(len(ids))
+        if num_instances == 0:
+            cmap = ListedColormap([(0, 0, 0, 1)])
+            norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
+            return instance_mask, cmap, norm
+
+        cmap = SAM2utils.build_instance_colormap(num_instances)
+        boundaries = np.arange(num_instances + 2) - 0.5
+        norm = BoundaryNorm(boundaries, ncolors=num_instances + 1)
+        return instance_mask, cmap, norm
+
+    @staticmethod
     def save_masks_as_images(masks: List[Dict[str, Any]], output_dir: str, prefix: str = "mask"):
         """
         Save automatic masks as individual image files.
@@ -443,6 +614,99 @@ class SAM2utils:
             mask_pil.save(os.path.join(output_dir, filename))
 
         print(f"Saved {len(masks)} prompt masks to {output_dir}")
+
+    # ==== Misc helpers (moved from sam2_client) ====
+    @staticmethod
+    def prevent_oom_resizing(image: Union[str, Image.Image], target: int) -> Image.Image:
+        img = Image.open(image) if isinstance(image, str) else image
+        w, h = img.width, img.height
+        max_side = max(w, h)
+        if max_side == target:
+            return img
+        scale = float(target) / float(max_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return img.resize((new_w, new_h), resample=Image.LANCZOS)
+
+    @staticmethod
+    def auto_masks_to_instance_mask(
+        masks_list: List[Dict[str, Any]],
+        min_iou: float = 0.0,
+        min_area: float = 0.0,
+        assign_by: str = "iou",
+        start_from: str = "high",
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        if not masks_list:
+            return np.zeros((1, 1), dtype=np.uint16), {"num_instances": 0}
+
+        # Filter masks by criteria (binary mask expectation)
+        filtered_masks = [m for m in masks_list
+                          if m.get('predicted_iou', 0) >= min_iou and m.get('area', 0) >= min_area]
+        if not filtered_masks:
+            return np.zeros((1, 1), dtype=np.uint16), {"num_instances": 0}
+
+        # Choose ranking key
+        def _area_of(m: Dict[str, Any]) -> float:
+            a = m.get('area')
+            if isinstance(a, (int, float)):
+                return float(a)
+            seg = m.get('segmentation')
+            return float(np.count_nonzero(seg)) if isinstance(seg, np.ndarray) else 0.0
+
+        def _key(m: Dict[str, Any]) -> float:
+            return float(m.get('predicted_iou', 0.0)) if assign_by == "iou" else _area_of(m)
+
+        # Order to assign instance ids and claim pixels
+        reverse = (start_from == "low")
+        ordered = sorted(filtered_masks, key=_key, reverse=reverse)
+
+        # Allocate instance ids; earlier assignments keep pixels (no overwrite)
+        first_mask = ordered[0]['segmentation']
+        h, w = first_mask.shape
+        instance_mask = np.zeros((h, w), dtype=np.uint16)
+
+        for idx, mask_dict in enumerate(ordered):
+            instance_id = idx + 1
+            mask = mask_dict['segmentation']
+            if mask.dtype != np.bool_:
+                mask = mask.astype(bool)
+            claim = mask & (instance_mask == 0)
+            instance_mask[claim] = instance_id
+
+        stats = {
+            "num_instances": len(filtered_masks),
+            "total_masks_before_filter": len(masks_list),
+            "min_iou_used": min_iou,
+            "min_area_used": min_area,
+            "assign_by": assign_by,
+            "start_from": start_from,
+        }
+        return instance_mask, stats
+
+    @staticmethod
+    def compute_overlap_stats(masks_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not masks_list:
+            return {"total_masks": 0, "overlap_matrix": []}
+        n_masks = len(masks_list)
+        overlap_matrix = np.zeros((n_masks, n_masks))
+        mask_arrays = [(m['segmentation'] > 0) for m in masks_list]
+        for i in range(n_masks):
+            for j in range(i, n_masks):
+                mi = mask_arrays[i]
+                mj = mask_arrays[j]
+                inter = np.logical_and(mi, mj).sum()
+                uni = np.logical_or(mi, mj).sum()
+                iou = inter / uni if uni > 0 else 0.0
+                overlap_matrix[i, j] = iou
+                overlap_matrix[j, i] = iou
+        upper = overlap_matrix[np.triu_indices(n_masks, k=1)]
+        return {
+            "total_masks": n_masks,
+            "overlap_matrix": overlap_matrix.tolist(),
+            "mean_overlap": float(upper.mean()) if len(upper) > 0 else 0.0,
+            "max_overlap": float(upper.max()) if len(upper) > 0 else 0.0,
+            "high_overlap_pairs": int((upper > 0.5).sum()) if len(upper) > 0 else 0
+        }
 
     @staticmethod
     def get_mask_statistics(masks: List[Dict[str, Any]]) -> Dict[str, Any]:

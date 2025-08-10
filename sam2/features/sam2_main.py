@@ -116,8 +116,8 @@ class SAM2features:
         else:
             params = {}
 
-        # Override preset with explicitly provided parameters via kwargs
-        params.update(kwargs)
+        # Override preset with explicitly provided parameters via kwargs only if not None
+        params.update({k: v for k, v in kwargs.items() if v is not None})
 
         # Create mask generator with specified parameters
         mask_generator = SAM2AutomaticMaskGenerator(model=self.model, **params)
@@ -228,6 +228,8 @@ if __name__ == "__main__":
     fine_masks = sam2.auto_mask(img, preset="fine_grained")
     print(f"Generated {len(fine_masks)} fine-grained masks")
     sam2.visualize_masks(img, fine_masks)
+    del fine_masks
+    torch.cuda.empty_cache()
 
     print("\n=== Prompt-based Mask Generation Demo ===")
 

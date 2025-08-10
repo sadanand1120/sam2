@@ -1,0 +1,28 @@
+# Core ML dependencies (install manually based on your CUDA version)
+# torch
+# torchvision
+
+# Image processing
+Pillow
+numpy
+opencv-python
+
+# HTTP requests (for image URL loading)
+requests
+aiohttp
+
+# Configuration and data
+pyyaml
+
+# Additional utilities
+typing-extensions
+
+# Direct API dependencies
+open-clip-torch  # For CLIP direct API
+timm            # For DINO direct API
+einops          # For CLIP direct API
+
+# SAM2 - assume already installed in environment
+
+# Visualization (optional, for testing)
+matplotlib
