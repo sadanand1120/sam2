@@ -65,7 +65,14 @@ class AsyncModelRunnerParallel:
         return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
     @classmethod
-    async def async_run_tasks(cls, awaitables: List[asyncio.Future], desc: Optional[str] = None) -> List[Any]:
+    async def async_run_tasks(
+        cls,
+        awaitables: List[asyncio.Future],
+        desc: Optional[str] = None,
+        position: Optional[int] = None,
+        disable: Optional[bool] = None,
+        leave: Optional[bool] = None,
+    ) -> List[Any]:
         if desc is None:
             desc = cls.__name__
 
@@ -75,7 +82,14 @@ class AsyncModelRunnerParallel:
 
         tasks = [asyncio.create_task(_wrap_with_index(i, aw)) for i, aw in enumerate(awaitables)]
         results: List[Any] = [None] * len(tasks)
-        with tqdm(total=len(tasks), desc=desc) as pbar:
+        bar_kwargs: Dict[str, Any] = {"desc": desc, "total": len(tasks)}
+        if position is not None:
+            bar_kwargs["position"] = position
+        if disable is not None:
+            bar_kwargs["disable"] = disable
+        if leave is not None:
+            bar_kwargs["leave"] = leave
+        with tqdm(**bar_kwargs) as pbar:
             for t in asyncio.as_completed(tasks):
                 i, res = await t
                 results[i] = res
@@ -136,8 +150,20 @@ class AsyncMultiWrapper:
         return _call_through
 
     @staticmethod
-    async def async_run_tasks(awaitables: List[asyncio.Future], desc: Optional[str] = None) -> List[Any]:
-        return await AsyncModelRunnerParallel.async_run_tasks(awaitables, desc)
+    async def async_run_tasks(
+        awaitables: List[asyncio.Future],
+        desc: Optional[str] = None,
+        position: Optional[int] = None,
+        disable: Optional[bool] = None,
+        leave: Optional[bool] = None,
+    ) -> List[Any]:
+        return await AsyncModelRunnerParallel.async_run_tasks(
+            awaitables,
+            desc=desc,
+            position=position,
+            disable=disable,
+            leave=leave,
+        )
 
 
 def interpolate_positional_embedding(positional_embedding: torch.Tensor, x: torch.Tensor, patch_size: int, w: int, h: int):
@@ -537,19 +563,9 @@ class SAM2utils:
     def build_instance_colormap(num_instances: int) -> ListedColormap:
         if num_instances <= 0:
             return ListedColormap([(0, 0, 0, 1)])
-
+        # Evenly spaced hues; alpha=1
         base = [plt.cm.hsv(t) for t in np.linspace(0, 1, num_instances, endpoint=False)]
-
-        order: List[int] = []
-        lo, hi = 0, num_instances - 1
-        while lo <= hi:
-            order.append(lo)
-            if lo != hi:
-                order.append(hi)
-            lo += 1
-            hi -= 1
-
-        colors = [(0, 0, 0, 1)] + [tuple(base[i][:3]) + (1,) for i in order]
+        colors = [(0, 0, 0, 1)] + [tuple(c[:3]) + (1,) for c in base]
         return ListedColormap(colors)
 
     @staticmethod
@@ -567,10 +583,41 @@ class SAM2utils:
             norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
             return instance_mask, cmap, norm
 
+        # 1) Centroids per instance id (row, col)
+        centroids = {}
+        for iid in ids:
+            rr, cc = np.where(instance_mask == iid)
+            # Safe even for 1-pixel instances
+            centroids[iid] = np.array([rr.mean(), cc.mean()], dtype=np.float64)
+
+        # 2) Farthest-point sampling over centroids to order instance IDs
+        ids_list = ids.tolist()
+        start_id = int(np.random.choice(ids_list))
+        ordered = [start_id]
+        remaining = set(ids_list)
+        remaining.remove(start_id)
+
+        while remaining:
+            # for each remaining, distance to nearest selected centroid
+            d_best, pick = -1.0, None
+            for r in remaining:
+                cr = centroids[r]
+                dmin = min(np.linalg.norm(cr - centroids[s]) for s in ordered)
+                if dmin > d_best:
+                    d_best, pick = dmin, r
+            ordered.append(pick)
+            remaining.remove(pick)
+
+        # 3) Remap mask IDs so color index 1..K follows the farthest-point order
+        viz_mask = np.zeros_like(instance_mask, dtype=instance_mask.dtype)
+        for new_idx, iid in enumerate(ordered, start=1):
+            viz_mask[instance_mask == iid] = new_idx
+
+        # 4) Colors: black for 0, then gradual hues for 1..K
         cmap = SAM2utils.build_instance_colormap(num_instances)
-        boundaries = np.arange(num_instances + 2) - 0.5
+        boundaries = np.arange(num_instances + 2) - 0.5  # [-0.5, 0.5, 1.5, ..., K+0.5]
         norm = BoundaryNorm(boundaries, ncolors=num_instances + 1)
-        return instance_mask, cmap, norm
+        return viz_mask, cmap, norm
 
     @staticmethod
     def save_masks_as_images(masks: List[Dict[str, Any]], output_dir: str, prefix: str = "mask"):
