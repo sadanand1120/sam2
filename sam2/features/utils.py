@@ -413,6 +413,31 @@ def upsample_and_unpad(patch_desc: torch.Tensor, target_size: Tuple[int, int], p
     return remove_padding(upsampled, pad_h, pad_w, format=tensor_format)
 
 
+@torch.inference_mode()
+def repackage_pixels_to_patch_grid(pixel_desc: torch.Tensor, pad_h: int, pad_w: int, patch_size: int) -> torch.Tensor:
+    """
+    Convert per-pixel descriptors (H, W, C) back to a patch grid (h, w, C).
+
+    Steps:
+    - Re-pad the pixel map at bottom/right by (pad_h, pad_w) to restore the padded shape
+    - Average-pool with kernel=stride=patch_size to obtain the patch grid
+
+    Args:
+        pixel_desc: Tensor of shape (H, W, C) without padding
+        pad_h: Bottom padding to restore
+        pad_w: Right padding to restore
+        patch_size: Patch size used by the model (also pooling kernel/stride)
+
+    Returns:
+        Tensor of shape (H_pad // patch_size, W_pad // patch_size, C)
+    """
+    feat_t = pixel_desc.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+    if pad_h or pad_w:
+        feat_t = torch.nn.functional.pad(feat_t, (0, pad_w, 0, pad_h), mode="constant", value=0.0)
+    pooled = torch.nn.functional.avg_pool2d(feat_t, kernel_size=patch_size, stride=patch_size)
+    return pooled.squeeze(0).permute(1, 2, 0)
+
+
 class SAM2utils:
     """
     Utility class for SAM2 output visualization and processing.
@@ -834,6 +859,68 @@ class SAM2utils:
             filtered = [m for m in filtered if m.get('stability_score', 0) >= min_stability]
 
         return filtered
+
+    @staticmethod
+    def resize_auto_masks(auto_masks: List[Dict[str, Any]], target: int) -> List[Dict[str, Any]]:
+        """
+        Resize SAM2 automatic masks to have max(image_side) == target.
+        - Resizes binary `segmentation` with nearest-neighbor
+        - Updates `area`, `bbox` (xywh), `point_coords`, and `crop_box` (xywh)
+        - Keeps `predicted_iou` and `stability_score`
+        """
+        if not auto_masks:
+            return auto_masks
+
+        # All masks share the same original size
+        seg0 = auto_masks[0]["segmentation"]
+        h, w = seg0.shape
+        max_side = max(w, h)
+        if max_side == target:
+            return auto_masks
+
+        scale = float(target) / float(max_side)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        resized_masks: List[Dict[str, Any]] = []
+        for m in auto_masks:
+            seg = m["segmentation"].astype(np.uint8) * 255
+            seg_img = Image.fromarray(seg, mode="L")
+            seg_resized = seg_img.resize((new_w, new_h), resample=Image.NEAREST)
+            seg_resized_np = (np.array(seg_resized) > 127)
+
+            # Scale geometry (xywh for bbox/crop_box; xy for points)
+            bbox = m.get("bbox", None)
+            if bbox is not None:
+                x, y, bw, bh = bbox
+                bbox_scaled = [x * scale, y * scale, bw * scale, bh * scale]
+            else:
+                bbox_scaled = None
+
+            pts = m.get("point_coords", None)
+            if pts is not None:
+                pts_scaled = [[px * scale, py * scale] for px, py in pts]
+            else:
+                pts_scaled = None
+
+            crop = m.get("crop_box", None)
+            if crop is not None:
+                cx, cy, cw, ch = crop
+                crop_scaled = [cx * scale, cy * scale, cw * scale, ch * scale]
+            else:
+                crop_scaled = None
+
+            resized_masks.append({
+                "segmentation": seg_resized_np,
+                "area": int(seg_resized_np.sum()),
+                "bbox": bbox_scaled if bbox_scaled is not None else m.get("bbox"),
+                "predicted_iou": m.get("predicted_iou", 0.0),
+                "point_coords": pts_scaled if pts_scaled is not None else m.get("point_coords"),
+                "stability_score": m.get("stability_score", 0.0),
+                "crop_box": crop_scaled if crop_scaled is not None else m.get("crop_box"),
+            })
+
+        return resized_masks
 
 
 if __name__ == "__main__":
