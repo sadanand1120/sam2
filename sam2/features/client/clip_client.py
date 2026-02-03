@@ -5,7 +5,7 @@ from PIL import Image
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from sam2.features.clip_main import CLIPfeatures
+from sam2.features.clip_main import CLIPfeatures, visualize_multi_scale_features
 from sam2.features.utils import upsample_and_unpad, AsyncModelRunnerParallel, AsyncMultiWrapper
 
 
@@ -88,7 +88,8 @@ class CLIPFeaturesUnified(AsyncModelRunnerParallel):
                              interpolation_mode: str = "bilinear",
                              tensor_format: str = "HWC",
                              padding_mode: str = "constant",
-                             return_meta: bool = False):
+                             return_meta: bool = False,
+                             ret_internal_feats: bool = False):
         """Extract multi-scale aggregated CLIP features."""
         pil_img = self.load_image(image, image_url)
         model = self._get_model(model_name, model_pretrained)
@@ -109,6 +110,7 @@ class CLIPFeaturesUnified(AsyncModelRunnerParallel):
                 tensor_format=tensor_format,
                 padding_mode=padding_mode,
                 return_meta=return_meta,
+                ret_internal_feats=ret_internal_feats,
             )
         return result
 
@@ -198,15 +200,25 @@ if __name__ == "__main__":
         load_size=2048,
     )
     print(f"Output shape (agg): {desc_agg.shape}")
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-    axs[0].imshow(desc_pca.cpu().numpy())
-    axs[0].set_title("CLIP Patch PCA Visualization")
-    axs[0].axis("off")
-    axs[1].imshow(desc_agg.cpu().numpy())
-    axs[1].set_title("CLIP Patch PCA Visualization (Multi-scale Aggregation)")
-    axs[1].axis("off")
-    plt.tight_layout()
-    plt.show()
+
+    # Demo: multi-scale aggregation with internal features
+    desc_agg_with_internal, internal_feats = clip.extract_features_agg(
+        image=test_image_path,
+        agg_scales=[0.25, 0.5, 0.75, 1.0, 1.5],
+        agg_weights=[1, 2, 3, 5.5, 2],
+        ret_pca=True,
+        ret_patches=False,
+        load_size=2048,
+        ret_internal_feats=True,
+    )
+    print(f"Output shape with internal feats: {desc_agg_with_internal.shape}")
+    print(f"Number of internal features: {len(internal_feats)}")
+    for i, feat in enumerate(internal_feats):
+        print(f"Internal feat {i} shape: {feat.shape}")
+
+    # Visualize aggregated and individual scale features together
+    scales = [0.25, 0.5, 0.75, 1.0, 1.5]
+    visualize_multi_scale_features(desc_agg_with_internal, internal_feats, scales)
 
     # Demo: Text similarity (patch resolution + upsample for viz)
     sim_map = clip.compute_similarity(

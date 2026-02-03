@@ -43,16 +43,16 @@ class SAM2features:
         self.AUTO_FINE_GRAINED_MASKS = {
             "points_per_side": 64,
             "points_per_batch": 128,
-            "pred_iou_thresh": 0.7,
-            "stability_score_thresh": 0.92,
-            "stability_score_offset": 0.7,
+            "pred_iou_thresh": 0.60,
+            "stability_score_thresh": 0.85,
+            "stability_score_offset": 0.70,
             "mask_threshold": 0.0,
-            "box_nms_thresh": 0.7,
+            "box_nms_thresh": 0.90,
             "crop_n_layers": 1,
             "crop_nms_thresh": 0.7,
-            "crop_overlap_ratio": 512 / 1500,
+            "crop_overlap_ratio": 0.50,
             "crop_n_points_downscale_factor": 2,
-            "min_mask_region_area": 25.0,
+            "min_mask_region_area": 0.0,
             "use_m2m": True,
             "multimask_output": True,
             "output_mode": "binary_mask"
@@ -61,14 +61,14 @@ class SAM2features:
         self.AUTO_COARSE_MASKS = {
             "points_per_side": 16,
             "points_per_batch": 64,
-            "pred_iou_thresh": 0.8,
-            "stability_score_thresh": 0.95,
-            "stability_score_offset": 1.0,
+            "pred_iou_thresh": 0.72,
+            "stability_score_thresh": 0.88,
+            "stability_score_offset": 0.75,
             "mask_threshold": 0.0,
-            "box_nms_thresh": 0.7,
+            "box_nms_thresh": 0.85,
             "crop_n_layers": 0,
             "crop_nms_thresh": 0.7,
-            "crop_overlap_ratio": 512 / 1500,
+            "crop_overlap_ratio": 0.45,
             "crop_n_points_downscale_factor": 1,
             "min_mask_region_area": 100.0,
             "use_m2m": False,
@@ -303,10 +303,6 @@ if __name__ == "__main__":
 
     # Example 5: Using SAM2utils directly for analysis
     print("\n--- SAM2utils Analysis Demo ---")
-
-    # Get mask statistics
-    stats = SAM2utils.get_mask_statistics(coarse_masks)
-    print(f"Coarse mask statistics: {stats}")
 
     # Filter masks by area
     large_masks = SAM2utils.filter_masks_by_area(coarse_masks, min_area=5000)

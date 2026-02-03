@@ -586,8 +586,8 @@ class SAM2utils:
 
     @staticmethod
     def build_instance_colormap(num_instances: int) -> ListedColormap:
-        if num_instances <= 0:
-            return ListedColormap([(0, 0, 0, 1)])
+        if num_instances == 0:  # no foreground instances
+            raise ValueError("No foreground instances, handle it upstream")
         # Evenly spaced hues; alpha=1
         base = [plt.cm.hsv(t) for t in np.linspace(0, 1, num_instances, endpoint=False)]
         colors = [(0, 0, 0, 1)] + [tuple(c[:3]) + (1,) for c in base]
@@ -595,15 +595,10 @@ class SAM2utils:
 
     @staticmethod
     def make_viz_mask_and_cmap(instance_mask: np.ndarray) -> Tuple[np.ndarray, ListedColormap, BoundaryNorm]:
-        if instance_mask.size == 0:
-            cmap = ListedColormap([(0, 0, 0, 1)])
-            norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
-            return instance_mask, cmap, norm
-
         ids = np.unique(instance_mask)
-        ids = ids[ids != 0]
+        ids = ids[ids != 0]   # remove background
         num_instances = int(len(ids))
-        if num_instances == 0:
+        if num_instances == 0:  # no foreground instances
             cmap = ListedColormap([(0, 0, 0, 1)])
             norm = BoundaryNorm([-0.5, 0.5], ncolors=1)
             return instance_mask, cmap, norm
@@ -645,50 +640,6 @@ class SAM2utils:
         return viz_mask, cmap, norm
 
     @staticmethod
-    def save_masks_as_images(masks: List[Dict[str, Any]], output_dir: str, prefix: str = "mask"):
-        """
-        Save automatic masks as individual image files.
-
-        Args:
-            masks: List of mask dictionaries from auto_mask()
-            output_dir: Directory to save mask images
-            prefix: Filename prefix for saved masks
-        """
-        import os
-        os.makedirs(output_dir, exist_ok=True)
-
-        for i, mask_dict in enumerate(masks):
-            mask = mask_dict['segmentation'].astype(np.uint8) * 255
-            mask_img = Image.fromarray(mask, mode='L')
-            mask_img.save(os.path.join(output_dir, f"{prefix}_{i:03d}.png"))
-
-        print(f"Saved {len(masks)} masks to {output_dir}")
-
-    @staticmethod
-    def save_prompt_masks_as_images(masks: np.ndarray, scores: np.ndarray,
-                                    output_dir: str, prefix: str = "prompt_mask"):
-        """
-        Save prompt-based masks as individual image files.
-
-        Args:
-            masks: Masks from prompt_mask()
-            scores: IoU scores from prompt_mask()
-            output_dir: Directory to save mask images
-            prefix: Filename prefix for saved masks
-        """
-        import os
-        os.makedirs(output_dir, exist_ok=True)
-
-        for i, (mask, score) in enumerate(zip(masks, scores)):
-            mask_img = (mask.astype(np.uint8) * 255)
-            mask_pil = Image.fromarray(mask_img, mode='L')
-            filename = f"{prefix}_{i:03d}_score_{score:.3f}.png"
-            mask_pil.save(os.path.join(output_dir, filename))
-
-        print(f"Saved {len(masks)} prompt masks to {output_dir}")
-
-    # ==== Misc helpers (moved from sam2_client) ====
-    @staticmethod
     def prevent_oom_resizing(image: Union[str, Image.Image], target: int) -> Image.Image:
         img = Image.open(image) if isinstance(image, str) else image
         w, h = img.width, img.height
@@ -707,15 +658,15 @@ class SAM2utils:
         min_area: float = 0.0,
         assign_by: str = "iou",
         start_from: str = "high",
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
         if not masks_list:
-            return np.zeros((1, 1), dtype=np.uint16), {"num_instances": 0}
+            return None, {"num_instances": 0}
 
         # Filter masks by criteria (binary mask expectation)
         filtered_masks = [m for m in masks_list
                           if m.get('predicted_iou', 0) >= min_iou and m.get('area', 0) >= min_area]
         if not filtered_masks:
-            return np.zeros((1, 1), dtype=np.uint16), {"num_instances": 0}
+            return None, {"num_instances": 0}
 
         # Choose ranking key
         def _area_of(m: Dict[str, Any]) -> float:
@@ -754,61 +705,6 @@ class SAM2utils:
             "start_from": start_from,
         }
         return instance_mask, stats
-
-    @staticmethod
-    def compute_overlap_stats(masks_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if not masks_list:
-            return {"total_masks": 0, "overlap_matrix": []}
-        n_masks = len(masks_list)
-        overlap_matrix = np.zeros((n_masks, n_masks))
-        mask_arrays = [(m['segmentation'] > 0) for m in masks_list]
-        for i in range(n_masks):
-            for j in range(i, n_masks):
-                mi = mask_arrays[i]
-                mj = mask_arrays[j]
-                inter = np.logical_and(mi, mj).sum()
-                uni = np.logical_or(mi, mj).sum()
-                iou = inter / uni if uni > 0 else 0.0
-                overlap_matrix[i, j] = iou
-                overlap_matrix[j, i] = iou
-        upper = overlap_matrix[np.triu_indices(n_masks, k=1)]
-        return {
-            "total_masks": n_masks,
-            "overlap_matrix": overlap_matrix.tolist(),
-            "mean_overlap": float(upper.mean()) if len(upper) > 0 else 0.0,
-            "max_overlap": float(upper.max()) if len(upper) > 0 else 0.0,
-            "high_overlap_pairs": int((upper > 0.5).sum()) if len(upper) > 0 else 0
-        }
-
-    @staticmethod
-    def get_mask_statistics(masks: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Compute statistics for automatic masks.
-
-        Args:
-            masks: List of mask dictionaries from auto_mask()
-
-        Returns:
-            Dictionary with mask statistics
-        """
-        if not masks:
-            return {"num_masks": 0}
-
-        areas = [mask_dict['area'] for mask_dict in masks]
-        ious = [mask_dict.get('predicted_iou', 0) for mask_dict in masks]
-        stability_scores = [mask_dict.get('stability_score', 0) for mask_dict in masks]
-
-        stats = {
-            "num_masks": int(len(masks)),
-            "mean_iou": round(float(np.mean(ious)), 3) if ious else 0.0,
-            "mean_stability": round(float(np.mean(stability_scores)), 3) if stability_scores else 0.0,
-            "mean_area": round(float(np.mean(areas)), 3),
-            "median_area": round(float(np.median(areas)), 3),
-            "min_area": int(min(areas)),
-            "max_area": int(max(areas)),
-            "total_area": int(sum(areas)),
-        }
-        return stats
 
     @staticmethod
     def filter_masks_by_area(masks: List[Dict[str, Any]],

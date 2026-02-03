@@ -147,7 +147,8 @@ class CLIPfeatures:
                     interpolation_mode: str = "bilinear",
                     tensor_format: str = "HWC",
                     padding_mode: str = "constant",
-                    return_meta: bool = False):
+                    return_meta: bool = False,
+                    ret_internal_feats: bool = False):
         """
         Multi-scale wrapper over extract() with patch-space aggregation.
         - For each scale s in agg_scales, runs extract at load_size * s to get a patch grid.
@@ -175,6 +176,12 @@ class CLIPfeatures:
             padding_mode=padding_mode,
             return_meta=True,
         )
+
+        # Initialize internal_feats list with same length as agg_scales, None for non-reference scales
+        internal_feats = [None] * len(agg_scales) if ret_internal_feats else None
+        if ret_internal_feats:
+            ref_idx = agg_scales.index(1.0)
+            internal_feats[ref_idx] = ref_patch
         H_pad_ref, W_pad_ref = ref_meta["padded_h"], ref_meta["padded_w"]
         pad_h_ref, pad_w_ref = ref_meta["pad_h"], ref_meta["pad_w"]
 
@@ -222,6 +229,8 @@ class CLIPfeatures:
                 padding_mode=padding_mode,
                 return_meta=True,
             )
+            if ret_internal_feats:
+                internal_feats[i] = patch_s
             # Align patch_s to the reference patch grid (memory-light compared to pixel-level)
             ps_t = patch_s.permute(2, 0, 1).unsqueeze(0)  # (1, d, h_s, w_s)
             target_size_hw = (int(h_ref), int(w_ref))
@@ -249,20 +258,39 @@ class CLIPfeatures:
             torch.cuda.empty_cache()
 
         if ret_pca:
-            patch_out = apply_pca_colormap(agg_patch, niter=pca_niter, q_min=pca_q_min, q_max=pca_q_max)
+            # Apply PCA to aggregated features and get projection parameters
+            patch_out, proj_V, low_rank_min, low_rank_max = apply_pca_colormap(
+                agg_patch, niter=pca_niter, q_min=pca_q_min, q_max=pca_q_max, return_proj=True
+            )
+            # Apply same PCA projection to internal features if requested
+            if ret_internal_feats and internal_feats is not None:
+                for i in range(len(internal_feats)):
+                    if internal_feats[i] is not None:
+                        internal_feats[i] = apply_pca_colormap(
+                            internal_feats[i], proj_V=proj_V, low_rank_min=low_rank_min,
+                            low_rank_max=low_rank_max, return_proj=False
+                        )
         else:
             patch_out = agg_patch
 
         if ret_patches:
             if return_meta:
+                if ret_internal_feats:
+                    return patch_out, ref_meta, internal_feats
                 return patch_out, ref_meta
+            if ret_internal_feats:
+                return patch_out, internal_feats
             return patch_out
         else:
             # Produce pixel-level output once at the end to limit VRAM usage
             src = patch_out if ret_pca else agg_patch
             pix = upsample_and_unpad(src, (H_pad_ref, W_pad_ref), pad_h_ref, pad_w_ref, tensor_format=tensor_format, mode=interpolation_mode)
             if return_meta:
+                if ret_internal_feats:
+                    return pix, ref_meta, internal_feats
                 return pix, ref_meta
+            if ret_internal_feats:
+                return pix, internal_feats
             return pix
 
     @torch.inference_mode()
@@ -328,6 +356,50 @@ class CLIPfeatures:
         return sim.reshape(h, w)
 
 
+def visualize_multi_scale_features(agg_features, internal_features, scales, figsize=(16, 8)):
+    """
+    Visualize aggregated and individual scale features together.
+
+    Args:
+        agg_features: Aggregated features tensor
+        internal_features: List of individual scale feature tensors
+        scales: List of scale values corresponding to internal_features
+        figsize: Figure size tuple (width, height)
+    """
+    n_scales = len(internal_features)
+    if n_scales != len(scales):
+        raise ValueError("Number of internal features must match number of scales")
+
+    # Calculate subplot layout for bottom row
+    if n_scales <= 4:
+        cols_bottom = n_scales
+    elif n_scales <= 6:
+        cols_bottom = 6
+    elif n_scales <= 8:
+        cols_bottom = 8
+    else:
+        cols_bottom = 10  # Cap at 10 for readability
+
+    fig = plt.figure(figsize=figsize)
+
+    # Top row: Aggregated features (larger)
+    ax_agg = plt.subplot(2, 1, 1)
+    ax_agg.imshow(agg_features.cpu().numpy())
+    ax_agg.set_title("Aggregated PCA Features (Multi-scale)", fontsize=14, fontweight='bold')
+    ax_agg.axis("off")
+
+    # Bottom row: Individual scale features (smaller, in a row)
+    for i, (scale, feat) in enumerate(zip(scales, internal_features)):
+        if feat is not None:
+            ax_scale = plt.subplot(2, cols_bottom, cols_bottom + i + 1)
+            ax_scale.imshow(feat.cpu().numpy())
+            ax_scale.set_title(f"Scale {scale}", fontsize=12)
+            ax_scale.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
     img = Image.open("notebooks/images/cars.jpg")
     clipper = CLIPfeatures(device=torch.device("cuda"))
@@ -342,15 +414,17 @@ if __name__ == "__main__":
     # Demo: multi-scale aggregation
     desc_agg = clipper.extract_agg(img, agg_scales=[0.25, 0.5, 1.0, 1.5], agg_weights=[1, 2, 5.5, 2], ret_pca=True, ret_patches=False, load_size=2048)
     print(f"Output shape: {desc_agg.shape}")
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-    axs[0].imshow(desc_pca.cpu().numpy())
-    axs[0].set_title("CLIP Patch PCA Visualization")
-    axs[0].axis("off")
-    axs[1].imshow(desc_agg.cpu().numpy())
-    axs[1].set_title("CLIP Patch PCA Visualization (Multi-scale Aggregation)")
-    axs[1].axis("off")
-    plt.tight_layout()
-    plt.show()
+
+    # Demo: multi-scale aggregation with internal features
+    desc_agg_with_internal, internal_feats = clipper.extract_agg(img, agg_scales=[0.25, 0.5, 1.0, 1.5], agg_weights=[1, 2, 5.5, 2], ret_pca=True, ret_patches=False, load_size=2048, ret_internal_feats=True)
+    print(f"Output shape with internal feats: {desc_agg_with_internal.shape}")
+    print(f"Number of internal features: {len(internal_feats)}")
+    for i, feat in enumerate(internal_feats):
+        print(f"Internal feat {i} shape: {feat.shape}")
+
+    # Visualize aggregated and individual scale features together
+    scales = [0.25, 0.5, 1.0, 1.5]
+    visualize_multi_scale_features(desc_agg_with_internal, internal_feats, scales)
 
     # Demo: text similarity, do similarity compute on patches for mem efficiency -> then upsample
     desc, meta = clipper.extract(img, ret_pca=False, ret_patches=True, load_size=2048, return_meta=True)

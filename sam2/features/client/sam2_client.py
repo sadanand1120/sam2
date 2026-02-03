@@ -156,12 +156,6 @@ if __name__ == "__main__":
     print(f"Generated {len(coarse_masks)} coarse masks")
     SAM2utils.visualize_masks(img, coarse_masks)
 
-    # Overlap analysis and instance mask demo for coarse
-    coarse_stats = SAM2utils.compute_overlap_stats(coarse_masks)
-    if coarse_stats["total_masks"] > 0:
-        coarse_pct = 100.0 * coarse_stats["high_overlap_pairs"] / (coarse_stats["total_masks"] * (coarse_stats["total_masks"] - 1) / 2) if coarse_stats["total_masks"] > 1 else 0
-        print(f"Coarse Overlap: masks={coarse_stats['total_masks']}, mean_overlap={coarse_stats['mean_overlap']:.3f}, high_overlap_pairs={coarse_stats['high_overlap_pairs']} ({coarse_pct:.1f}%)")
-
     # 2x2 grid of instance masks for (assign_by x start_from)
     configs = [("iou", "high"), ("iou", "low"), ("area", "high"), ("area", "low")]
     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
@@ -169,7 +163,13 @@ if __name__ == "__main__":
         inst_mask, stats = SAM2utils.auto_masks_to_instance_mask(
             coarse_masks, min_iou=0.7, assign_by=assign_by, start_from=start_from
         )
-        viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+        if inst_mask is not None:
+            viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
+        else:
+            # Create all-zeros instance mask with same shape as original image
+            h, w = np.array(img).shape[:2]
+            inst_mask = np.zeros((h, w), dtype=np.uint16)
+            viz_mask, cmap, norm = SAM2utils.make_viz_mask_and_cmap(inst_mask)
         ax.imshow(viz_mask, cmap=cmap, norm=norm)
         ax.set_title(f"{assign_by}, {start_from}")
         ax.axis("off")
@@ -261,18 +261,12 @@ if __name__ == "__main__":
     # Example 5: Using SAM2utils directly for analysis
     print("\n--- SAM2utils Analysis Demo ---")
 
-    # Get mask statistics
-    stats = SAM2utils.get_mask_statistics(coarse_masks)
-    print(f"Coarse mask statistics: {stats}")
-
     # Filter masks by area
     large_masks = SAM2utils.filter_masks_by_area(coarse_masks, min_area=5000)
     print(f"Large masks (>5000 pixels): {len(large_masks)}")
-
     # Filter by quality scores
     high_quality_masks = SAM2utils.filter_masks_by_score(coarse_masks, min_iou=0.8)
     print(f"High quality masks (IoU>0.8): {len(high_quality_masks)}")
-
     # Visualize filtered results
     if large_masks:
         print("Visualizing large masks:")
